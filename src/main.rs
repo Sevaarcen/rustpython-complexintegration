@@ -1,103 +1,122 @@
-use std::time::Instant;
-use std::process::{Command, Stdio};
-use std::env::current_exe;
-use pyo3::PyTryInto;
+use serde_json::json;
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::{Sender, Receiver};
 use uuid::Uuid;
-use threadpool::ThreadPool;
-use clap::{Arg, App};
-use pyo3::{Python, types::{PyLong, PyModule}};
+use std::thread;
+use log::{debug, info, warn, error};
+
+use actix_web::web::Bytes;
+use actix_web::http::StatusCode;
+use actix_web::{HttpRequest, HttpResponse, HttpServer, Result, post};
+
+use crate::model::DataObject;
+use crate::plugin_handlers::Plugin;
+
+mod plugin_handlers;
+mod model;
 
 
-fn spawn_child() {
-    // lazily for this project, but just run another instance of the same executable but using the "worker" runtype.
-    let exe_path = current_exe().unwrap();
-    let mut child_process = Command::new(exe_path)
-        .arg("worker")
-        .stdout(Stdio::inherit()) // use the broker process' stdout and stderr
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
-    // run child process and debug print exit status.
-    let status = child_process.wait();
-    match status {
-        Ok(es) => println!("Finished with status: {}", es),
-        Err(e) => println!("!!! Error: {}", e)
-    }
-}
+fn manager_main(mut rx: Receiver<Bytes>) {
+    info!("Manager main method is now running.");
 
+    info!("Loading plugins...");
+    let plugins = plugin_handlers::load_plugins();
+    info!("Finished loading plugins, loaded a total of: {}", plugins.len());
 
-fn worker_main() {
-    // run 8 jobs in rust, then 8 jobs using Python code from Rust
-    rust_task();
-    python_task();
-}
+    info!("Spawning tokio runtime");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
 
-
-fn rust_task() -> usize {
-    let start_time = Instant::now();
-    let uuid = Uuid::new_v4();
-    let mut num_found = 0;
-    for num in 0..25_000_000 {
-        if num % 2 == 0 || num % 3 == 0 || num % 5 == 0 {
-            let bitthing = num ^ 0x42;
-            let isthree = bitthing & 3;
-            if isthree == 3 {
-                num_found += 1;
+    // run logic loop until the transmitter is closed (no more jobs will be sent)
+    loop {
+        debug!("Top of Manager loop");
+        let maybe_job = rx.blocking_recv();
+        debug!("Manager received job");
+        let job = match maybe_job {
+            Some(job) => {
+                job
+            },
+            None => {
+                info!("Receiver is closed... shutting down manager");
+                return;
             }
-            if num_found % 250_000 == 0 {
-                println!("RUST {} found {} so far in {}", uuid, num_found, num);
+        };
+
+        let task_uuid = Uuid::new_v4();
+        let job_meta = json!({"uuid": task_uuid, "job_size": job.len()}).as_object().unwrap().to_owned();
+        info!("Working job of size: {}", job_meta.get("job_size").unwrap());
+        let data_object = DataObject{data: job.to_vec(), meta: job_meta};
+        debug!("{:?}", data_object);
+        for plugin in &plugins {
+            debug!("POINTERS plugin: {:p},  plugins: {:p}", &plugin, &plugins);
+            if plugin.check(&data_object) {
+                info!("Plugin will run for job: {}", plugin);
+                let plugin_copy = plugin.clone();
+                let do_copy = data_object.clone();
+                //let job_result = plugin.run(&do_copy);
+                
+                //info!("RESULTS OF PLUGIN JOB {}  ====>  {:?}", task_uuid, job_result);
+                runtime.spawn(async move {
+                    debug!("POINTERS plugin_copy: {:p}", &plugin_copy);
+                    let job_result = plugin_copy.run(&do_copy);
+                    //let job_result = model::PluginResults::None;
+                    info!("Task {} finished and returned: {:?}", task_uuid, job_result);
+                });
             }
         }
     }
-    let runtime = start_time.elapsed();
-    println!("Finished in: {}.{}", runtime.as_secs(), runtime.subsec_nanos());
-    println!("Worker result: {}", num_found);
-    num_found
 }
 
 
-fn python_task() -> usize {
-    // This task just loads, then runs the python code.
-    let result = Python::with_gil(|py_interpreter| {
-        // read the source code file into a string, then parse it into a Python module
-        let source_path = "test_python_code.py";
-        let testcode_str = std::fs::read_to_string(&source_path).unwrap();
-
-        let module = PyModule::from_code(
-            py_interpreter,
-            &testcode_str,
-            "test_python_code.py",
-            "test"
-        ).unwrap();
-
-        // get and run entrypoint method in python code
-        let function_return_val: &PyLong = module.getattr("test_function").unwrap().call0().unwrap().try_into().unwrap();
-        println!("Worker result: {}", function_return_val);
-        // return python int (PyLong w/ pyo3) to Rusts' usize
-        function_return_val.extract().unwrap()
-    });
-    result
-}
-
-fn main() {
-    // use clap since we need to run multiple processes. Rather than make two seperate binaries, use the same one with two runtypes based on positional arg.
-    let args = App::new("Testing program")
-        .arg(Arg::with_name("ptype")
-            .possible_values(&["worker", "broker"])
-            .index(1))
-        .get_matches();
+#[post("/test")]
+async fn dispatch(req: HttpRequest, body: Bytes) -> Result<HttpResponse> {
+    debug!("Dispatching...");
+    // take raw payload from POST request and transmit to worker manager for job dispatching.
+    let tx = req.app_data::<Sender<Bytes>>().unwrap();
+    tx.send(body).await.unwrap();
     
-    // if broker, spawn threads that each will execute and manage a new worker process
-    if args.value_of("ptype").unwrap() == "broker" {
-        let n_workers = 8;
-        let pool = ThreadPool::new(n_workers);
-        for _ in 0..n_workers {
-            pool.execute(|| spawn_child());
-        }
-        pool.join();
-    } else {
-        // if worker, prepare Python and then run code
-        pyo3::prepare_freethreaded_python();
-        worker_main();
-    }        
+    debug!("Done dispatching");
+    Ok(HttpResponse::build(StatusCode::CREATED)
+        .body("Received")
+    )
+}
+
+
+#[actix_web::main]
+async fn main() {
+    // initialize and setup logging
+    std::env::set_var("RUST_LOG", "debug");
+    env_logger::init();
+
+    debug!("MAIN STARTING");
+
+    // make channels for handling incoming/outgoing jobs
+    let (manager_tx, manager_rx) = mpsc::channel::<Bytes>(25);
+    
+    // build and run Actix Web server
+    debug!("Building and running Actix Web Server");
+    // TODO remove below for testing, it should send two values which *should* execute in parallel and then end once they are worked to completion
+    thread::spawn(move || {
+        // send two jobs that should run in parallel
+        manager_tx.blocking_send(Bytes::from("THIS IS A STRING WRITTEN BY A MAD MAN")).unwrap();
+        manager_tx.blocking_send(Bytes::from("{\"WHY\": \"Is multiprocessing causing such undefined behavior... ?\"}")).unwrap();
+        warn!("END OF SENDING");
+    });
+    /* 
+    let server_future = HttpServer::new(move || {
+        App::new()
+            .wrap(middleware::Logger::default())
+            .app_data(manager_tx.clone())
+            .service(dispatch)
+    })
+    .bind("127.0.0.1:8080").unwrap()
+    .run();*/
+
+    // Spawn worker manager in background
+    debug!("Spawning worker manager");
+    //let mut rt = actix_web::rt::System::new("workworkwork");
+    //rt.block_on(manager_main(manager_rx));
+    manager_main(manager_rx);
+    //server_future.await.unwrap();
+
+    debug!("END OF MAIN");
 }
